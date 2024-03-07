@@ -12,6 +12,7 @@ class DAN(nn.Module):
         resnet = models.resnet18(pretrained)
         
         if pretrained:
+            #checkpoint = torch.load('./models/resnet18_msceleb.pth', map_location=torch.device("mps"))
             checkpoint = torch.load('./models/resnet18_msceleb.pth')
             resnet.load_state_dict(checkpoint['state_dict'],strict=True)
 

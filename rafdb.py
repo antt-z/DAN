@@ -3,6 +3,9 @@ import sys
 import warnings
 from tqdm import tqdm
 import argparse
+from pathlib import Path
+from utils.wandb_utils import WandbLogger
+from utils.general import increment_path
 
 from PIL import Image
 import numpy as np
@@ -13,8 +16,8 @@ import torch.nn as nn
 import torch.utils.data as data
 from torchvision import transforms
 
-
-from sklearn.metrics import balanced_accuracy_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, roc_curve, \
+    confusion_matrix, balanced_accuracy_score
 
 from networks.dan import DAN
 
@@ -32,6 +35,9 @@ def parse_args():
     parser.add_argument('--workers', default=4, type=int, help='Number of data loading workers.')
     parser.add_argument('--epochs', type=int, default=40, help='Total training epochs.')
     parser.add_argument('--num_head', type=int, default=4, help='Number of attention head.')
+    parser.add_argument('--project', type=str, default='dan', help='save to wandb')
+    parser.add_argument('--name', type=str, default='dan', help='save to wandb')
+    parser.add_argument('--use_mps', action='store_true', default=False, help='enable MPS')
 
     return parser.parse_args()
 
@@ -120,9 +126,13 @@ class PartitionLoss(nn.Module):
             
         return loss
 
+
 def run_training():
     args = parse_args()
+    save_dir = increment_path(Path(args.project) / args.name, exist_ok=False)
+    wandb_logger = WandbLogger(args, Path(save_dir).stem)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    #device = torch.device("mps" if args.use_mps else "cpu")
 
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
@@ -139,12 +149,18 @@ def run_training():
                 transforms.RandomRotation(20),
                 transforms.RandomCrop(224, padding=32)
             ], p=0.2),
+        transforms.RandomApply([
+            transforms.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 5)),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1),
+            # 随机仿射变换
+            transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1))
+        ], p=0.5),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225]),
         transforms.RandomErasing(scale=(0.02,0.25)),
         ])
-    
+
     train_dataset = RafDataSet(args.raf_path, phase = 'train', transform = data_transforms)    
     
     print('Whole train set size:', train_dataset.__len__())
@@ -208,7 +224,10 @@ def run_training():
 
         acc = correct_sum.float() / float(train_dataset.__len__())
         running_loss = running_loss/iter_cnt
-        tqdm.write('[Epoch %d] Training accuracy: %.4f. Loss: %.3f. LR %.6f' % (epoch, acc, running_loss,optimizer.param_groups[0]['lr']))
+        # tqdm.write('[Epoch %d] Training accuracy: %.4f. Loss: %.3f. LR %.6f' % (epoch, acc, running_loss,optimizer.param_groups[0]['lr']))
+        wandb_logger.log({'Training Accuracy': acc,
+                          'Training Loss': running_loss.item(),
+                          'Learning Rate': optimizer.param_groups[0]['lr']})
         
         with torch.no_grad():
             running_loss = 0.0
@@ -249,15 +268,26 @@ def run_training():
             y_pred = np.concatenate(y_pred)
             balanced_acc = np.around(balanced_accuracy_score(y_true, y_pred),4)
 
-            tqdm.write("[Epoch %d] Validation accuracy:%.4f. bacc:%.4f. Loss:%.3f" % (epoch, acc, balanced_acc, running_loss))
-            tqdm.write("best_acc:" + str(best_acc))
+            P = precision_score(y_true=y_true, y_pred=y_pred, average="weighted", zero_division=1)
+            R = recall_score(y_true=y_true, y_pred=y_pred, average="weighted", zero_division=1)
+            F1 = f1_score(y_true=y_true, y_pred=y_pred, average="weighted", zero_division=1)
 
-            if acc > 0.89 and acc == best_acc:
+            #tqdm.write("[Epoch %d] Validation accuracy:%.4f. bacc:%.4f. Loss:%.3f" % (epoch, acc, balanced_acc, running_loss))
+            #tqdm.write("best_acc:" + str(best_acc))
+            wandb_logger.log({'Validation Accuracy': acc,
+                              'Validation Loss': running_loss.item(),
+                              'Validation precision': P,
+                              'Validation recall': R,
+                              'Validation F1': F1})
+
+            if acc > 0.897 and acc == best_acc:
                 torch.save({'iter': epoch,
                             'model_state_dict': model.state_dict(),
                              'optimizer_state_dict': optimizer.state_dict(),},
-                            os.path.join('checkpoints', "rafdb_epoch"+str(epoch)+"_acc"+str(acc)+"_bacc"+str(balanced_acc)+".pth"))
+                            os.path.join('models', "rafdb_epoch"+str(epoch)+"_acc"+str(acc)+"_bacc"+str(balanced_acc)+".pth"))
                 tqdm.write('Model saved.')
+
+        wandb_logger.end_epoch()
 
         
 if __name__ == "__main__":        
